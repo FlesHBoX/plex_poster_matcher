@@ -65,6 +65,7 @@ Pass --restart to ignore all of the above and reprocess everything.
 """
 import argparse
 import csv
+import json
 import os
 import shutil
 import sys
@@ -174,6 +175,10 @@ def process_item(tpdb, plex_lib_item):
         # correspond to one), so we point here instead of guessing.
         "tpdb_url": match["url"],
         "image_url": image_url,
+        # Every target-uploader poster found for this title, priority-order
+        # winner first — used to catalog cases where more than one option
+        # existed (see multi_options.json / overrides.html).
+        "options": found,
     }
 
 
@@ -209,6 +214,27 @@ def _rewrite_report(path, fieldnames, rows_by_key):
             "Notepad, etc. take an exclusive lock on CSVs).\n"
             "Close it there and re-run the exact same command — nothing has been "
             "lost, this will pick back up from here."
+        )
+
+
+def _load_multi_options(path):
+    """Returns a dict keyed by (title, year, type) -> record, or {} if the
+    file doesn't exist yet."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        records = json.load(f)
+    return {(r["title"], str(r["year"]), r["type"]): r for r in records}
+
+
+def _rewrite_multi_options(path, records_by_key):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(list(records_by_key.values()), f, indent=2)
+    except PermissionError:
+        sys.exit(
+            f"\nCouldn't write to {path} — likely open in another program. "
+            "Close it and re-run the exact same command."
         )
 
 
@@ -364,6 +390,7 @@ def main():
     matched_path = os.path.join(config.OUTPUT_DIR, "matched.csv")
     unmatched_path = os.path.join(config.OUTPUT_DIR, "unmatched.csv")
     manual_path = os.path.join(config.OUTPUT_DIR, "manual.csv")
+    multi_options_path = os.path.join(config.OUTPUT_DIR, "multi_options.json")
 
     if args.restart:
         for p in (matched_path, unmatched_path):
@@ -376,6 +403,7 @@ def main():
 
     matched_by_key = _load_report(matched_path)
     unmatched_by_key = _load_report(unmatched_path)
+    multi_options_by_key = _load_multi_options(multi_options_path)
 
     print("Connecting to Plex...")
     plex = plex_client.connect()
@@ -463,7 +491,26 @@ def main():
                 if not args.no_images:
                     saved_path = _save_poster_locally(title, year, lib_item["type"], result["image_url"], tpdb.session)
 
-                print(f"MATCHED ({result['uploader']})")
+                print(f"MATCHED ({result['uploader']})", end="")
+                options = result.get("options", [])
+                if len(options) > 1:
+                    print(f"  [{len(options)} options — see overrides.html]")
+                    multi_options_by_key[key] = {
+                        "title": title,
+                        "year": year,
+                        "type": lib_item["type"],
+                        "tpdb_url": result["tpdb_url"],
+                        "chosen_image_url": result["image_url"],
+                        "options": [
+                            {"uploader": u, "poster_id": pid, "image_url": img}
+                            for u, pid, img in options
+                        ],
+                    }
+                    _rewrite_multi_options(multi_options_path, multi_options_by_key)
+                else:
+                    print()
+                    multi_options_by_key.pop(key, None)
+
                 matched_by_key[key] = {
                     "title": title,
                     "year": year,
@@ -488,6 +535,8 @@ def main():
                     "tpdb_url": result.get("tpdb_url", ""),
                 }
                 matched_by_key.pop(key, None)  # in case it flipped from a previous matched result
+                if multi_options_by_key.pop(key, None) is not None:
+                    _rewrite_multi_options(multi_options_path, multi_options_by_key)
                 _rewrite_report(unmatched_path, UNMATCHED_FIELDS, unmatched_by_key)
                 unmatched_count += 1
     finally:

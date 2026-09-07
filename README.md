@@ -148,6 +148,41 @@ manual entry always overrides whatever the automated scraper found for
 that title. `--restart` never touches `manual.csv` — it's your own
 curated data, not something the script regenerates.
 
+### Reviewing titles with multiple poster options
+
+`find_target_posters()` always checks every uploader in `TPDB_USERS`, not
+just the first one that matches — when more than one of your configured
+uploaders has a poster for the same title, the script picks whichever
+one is listed first in `TPDB_USERS` and quietly discards the rest. If
+you'd rather see all the options and pick for yourself sometimes, there's
+a browsable page for that:
+
+```bash
+python main.py                       # normal run — this also writes
+                                      # output/multi_options.json for any
+                                      # title with more than one option
+python generate_overrides_page.py    # builds output/overrides.html
+```
+
+Open `output/overrides.html` in a browser (double-click it, no server
+needed). Click a title to see every option with the uploader's name
+underneath; the one the script picked is marked "default." Click a
+different poster to override it — your picks are saved in the browser
+(`localStorage`), so it's fine to close the page and come back later.
+
+When you're done, click **Export overrides.csv**, then fold it into your
+real `manual.csv`:
+
+```bash
+python merge_overrides.py            # merges output/overrides.csv into manual.csv
+python main.py                       # applies your overrides
+```
+
+Re-run `generate_overrides_page.py` any time `multi_options.json`
+changes (e.g. after a `--reverify` pass) to pick up newly-discovered
+multi-option titles — your existing selections aren't lost, since
+they live in the browser, not the generated file.
+
 Full library runs will take a while — with the default 1-second delay,
 ~2,000 titles is roughly an hour or two, more when titles need extra
 lookups (subtitle fallback searches, resolving ties). Turn `REQUEST_DELAY`
