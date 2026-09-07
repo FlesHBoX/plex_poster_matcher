@@ -16,6 +16,12 @@ Usage:
                                     # as unmatched (e.g. after a code fix or
                                     # a new TPDb upload) — anything already
                                     # matched AND applied is still skipped
+    python main.py --backfill-multi-options
+                                    # read-only pass over already-matched
+                                    # items purely to populate
+                                    # multi_options.json (see below) —
+                                    # never touches Plex, matched.csv, or
+                                    # downloaded images
 
 Output (rewritten after every change, not just at the end, so progress is
 never lost to an interruption):
@@ -238,6 +244,89 @@ def _rewrite_multi_options(path, records_by_key):
         )
 
 
+def _load_checked_keys(path):
+    """Keys already visited by a --backfill-multi-options pass, so an
+    interrupted backfill can resume instead of re-checking everything."""
+    if not os.path.exists(path):
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return {tuple(k) for k in json.load(f)}
+
+
+def _save_checked_keys(path, checked_keys):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([list(k) for k in checked_keys], f)
+
+
+def backfill_multi_options(tpdb, matched_by_key, library_by_key, multi_options_path,
+                            multi_options_by_key, checked_path, checked_keys):
+    """
+    Re-runs TPDb discovery (search + poster listing) for every already-
+    matched item, purely to populate multi_options.json — does NOT touch
+    Plex, matched.csv, or downloaded images, since those are already
+    correct. For a library that was fully processed before this feature
+    existed, without paying the cost of a full --restart (which would
+    also redundantly re-apply everything to Plex and re-download every
+    poster).
+
+    Resumable via checked_path: to force rechecking everything from
+    scratch, delete output/multi_options_checked.json — this function has
+    no --restart of its own.
+    """
+    remaining = [k for k in matched_by_key if k not in checked_keys]
+    already_done = len(matched_by_key) - len(remaining)
+    if already_done:
+        print(f"{already_done} item(s) already checked in a previous backfill run, skipping those.")
+    print(f"Checking {len(remaining)} already-matched item(s) for additional poster options...")
+
+    cataloged = 0
+    for i, key in enumerate(remaining, 1):
+        lib_item = library_by_key.get(key)
+        title, year, item_type = key
+        label = f"{title} ({year})" if year else title
+
+        if lib_item is None:
+            print(f"[{i}/{len(remaining)}] {label} ... no longer in Plex library, skipping")
+            checked_keys.add(key)
+            _save_checked_keys(checked_path, checked_keys)
+            continue
+
+        print(f"[{i}/{len(remaining)}] {label} ...", end=" ", flush=True)
+        result = process_item(tpdb, lib_item)
+
+        if result["status"] == "matched":
+            options = result.get("options", [])
+            if len(options) > 1:
+                multi_options_by_key[key] = {
+                    "title": title,
+                    "year": year,
+                    "type": item_type,
+                    "tpdb_url": result["tpdb_url"],
+                    # Reflect what's ACTUALLY applied in Plex right now
+                    # (from matched.csv), not whatever this fresh
+                    # re-search happens to prefer — TPDb's own data or
+                    # ordering could have shifted slightly since the
+                    # original run.
+                    "chosen_image_url": matched_by_key[key]["image_url"],
+                    "options": [
+                        {"uploader": u, "poster_id": pid, "image_url": img}
+                        for u, pid, img in options
+                    ],
+                }
+                _rewrite_multi_options(multi_options_path, multi_options_by_key)
+                print(f"[{len(options)} options cataloged]")
+                cataloged += 1
+            else:
+                print("(only one option, nothing to catalog)")
+        else:
+            print(f"(couldn't re-verify — {result['status']} — leaving existing match alone)")
+
+        checked_keys.add(key)
+        _save_checked_keys(checked_path, checked_keys)
+
+    print(f"\nDone. {cataloged} title(s) newly cataloged with multiple options.")
+
+
 def _save_poster_locally(title, year, item_type, image_url, session):
     """Download a matched poster to output/posters/<movies|shows>/, return
     the saved path (or "" on failure — caller treats that as no local copy)."""
@@ -382,6 +471,12 @@ def main():
         help="Also re-check items previously recorded as unmatched (in case of a code fix or "
              "new TPDb upload). Items already matched AND applied are still skipped.",
     )
+    parser.add_argument(
+        "--backfill-multi-options", action="store_true",
+        help="Read-only pass over already-matched items purely to populate multi_options.json "
+             "(for a library that was fully processed before that feature existed). "
+             "Never touches Plex, matched.csv, or downloaded images.",
+    )
     args = parser.parse_args()
 
     config.validate()
@@ -391,6 +486,7 @@ def main():
     unmatched_path = os.path.join(config.OUTPUT_DIR, "unmatched.csv")
     manual_path = os.path.join(config.OUTPUT_DIR, "manual.csv")
     multi_options_path = os.path.join(config.OUTPUT_DIR, "multi_options.json")
+    checked_path = os.path.join(config.OUTPUT_DIR, "multi_options_checked.json")
 
     if args.restart:
         for p in (matched_path, unmatched_path):
@@ -411,6 +507,19 @@ def main():
     if args.limit:
         library_items = library_items[: args.limit]
     print(f"Found {len(library_items)} movies/shows in your Plex library.")
+
+    if args.backfill_multi_options:
+        library_by_key = {
+            _item_key(item["title"], item["year"], item["type"]): item for item in library_items
+        }
+        checked_keys = _load_checked_keys(checked_path)
+        tpdb = TPDbClient()
+        backfill_multi_options(
+            tpdb, matched_by_key, library_by_key, multi_options_path,
+            multi_options_by_key, checked_path, checked_keys,
+        )
+        return
+
     print(f"Looking for posters from: {', '.join(config.TPDB_USERS)}")
     if args.dry_run:
         print("(--dry-run: nothing will actually be applied to Plex)")

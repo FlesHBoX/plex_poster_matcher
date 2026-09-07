@@ -155,7 +155,27 @@ just the first one that matches — when more than one of your configured
 uploaders has a poster for the same title, the script picks whichever
 one is listed first in `TPDB_USERS` and quietly discards the rest. If
 you'd rather see all the options and pick for yourself sometimes, there's
-a browsable page for that:
+a browsable page for that.
+
+**If your library is already fully processed** (this feature only
+catalogs titles as they're freshly searched, so anything matched before
+it existed was never recorded), backfill it once with a read-only pass —
+this never touches Plex, `matched.csv`, or your downloaded posters, it
+only re-runs the TPDb search/lookup step to see what else was out there:
+
+```bash
+python main.py --backfill-multi-options
+```
+
+This is resumable the same way everything else is (Ctrl+C-safe, just
+re-run the same command) — progress is tracked in
+`output/multi_options_checked.json`; delete that file if you ever want
+to recheck everything from scratch. It still costs one TPDb lookup per
+already-matched title, so expect it to take about as long as your
+original full run did.
+
+Going forward, a normal run keeps `multi_options.json` up to date on its
+own — no backfill needed for anything processed from here on out.
 
 ```bash
 python main.py                       # normal run — this also writes
@@ -182,6 +202,9 @@ Re-run `generate_overrides_page.py` any time `multi_options.json`
 changes (e.g. after a `--reverify` pass) to pick up newly-discovered
 multi-option titles — your existing selections aren't lost, since
 they live in the browser, not the generated file.
+
+
+curated data, not something the script regenerates.
 
 Full library runs will take a while — with the default 1-second delay,
 ~2,000 titles is roughly an hour or two, more when titles need extra
