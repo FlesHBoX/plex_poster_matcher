@@ -96,6 +96,20 @@ def process_item(tpdb, plex_lib_item):
     except Exception as exc:  # network hiccup, unexpected HTML, etc.
         return {"status": "error", "reason": f"search failed: {exc}"}
 
+    # If nothing on the quick pass even shares the target year, this might
+    # be a case like "RED" (2010) or "Mother!" (2017) — a generic title
+    # buried behind dozens of unrelated same-named entries on TPDb, spread
+    # across many pages with no useful sort order. Page through further
+    # rather than giving up immediately; this only fires for titles that
+    # actually need it, so it doesn't add cost to the common case.
+    if year and not any(c.get("year") == year for c in candidates):
+        try:
+            deep_candidates, _pages_fetched = tpdb.search_deep_until_year(search_title, category, year)
+        except Exception as exc:
+            return {"status": "error", "reason": f"deep search failed: {exc}"}
+        seen = {c["url"] for c in candidates}
+        candidates += [c for c in deep_candidates if c["url"] not in seen]
+
     match, ambiguous, tied = matcher.best_match(search_title, year, candidates)
 
     if match is None:

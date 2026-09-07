@@ -29,6 +29,21 @@ if short:
     print(f"Title has a subtitle separator -> also trying shortened search term: {short!r}")
 candidates = tpdb.search_with_fallback(search_title, category)
 
+if not any(c.get("year") == year for c in candidates):
+    print(f"Nothing on the quick pass matches year {year} — trying deep pagination "
+          f"(up to 40 pages, stopping as soon as a page has a year match)...")
+    deep, pages_fetched = tpdb.search_deep_until_year(search_title, category, year)
+    seen = {c["url"] for c in candidates}
+    new_ones = [c for c in deep if c["url"] not in seen]
+    candidates += new_ones
+    found_it = any(c.get("year") == year for c in new_ones)
+    print(f"Deep search fetched {pages_fetched} page(s), adding {len(new_ones)} new candidate(s).")
+    if found_it:
+        print(f"Found a year-{year} match on page {pages_fetched}.")
+    else:
+        print(f"Did NOT find a year-{year} match — exhausted all {pages_fetched} available page(s).")
+    print()
+
 print(f"Plex title: {title!r} ({year})")
 print(f"TPDb returned {len(candidates)} combined raw candidate(s) for section={category}:\n")
 

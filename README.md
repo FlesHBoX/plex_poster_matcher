@@ -187,6 +187,17 @@ technical minimum.
   though the matcher itself would score them fine if they showed up in
   the candidate list. Rare enough not to be worth a dedicated fallback —
   just search TPDb by hand for the handful of titles like this.
+- **Generic one-word titles were a needle in a haystack — now handled,
+  at a cost.** Titles like "RED" or "Mother!" collide with dozens of
+  unrelated same-named entries on TPDb (other films, shorts, fan
+  projects), spread across many pages of search results with no
+  apparent sort order (confirmed: "RED" alone has 28 such pages). When
+  the quick search finds nothing matching the target year at all, the
+  script now pages through further automatically (up to 40 pages),
+  stopping as soon as it finds one that does. This can take a while for
+  a title that genuinely needs it (each page is a separate polite,
+  rate-limited request) — it only ever triggers for titles that fail
+  the cheap first pass, so it doesn't slow down the common case.
 - **Season-level posters aren't covered yet.** DarkMatte in particular
   uploads a lot of per-season show posters (e.g. "Andor (2022) - Season
   2"), which this script doesn't currently match against Plex's season

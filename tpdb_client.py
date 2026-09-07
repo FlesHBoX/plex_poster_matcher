@@ -134,6 +134,66 @@ class TPDbClient:
             candidates = candidates + [c for c in more if c["url"] not in seen]
         return candidates
 
+    def search_deep_until_year(self, title, category, target_year, max_pages=40):
+        """
+        Paginate through search results (following each page's real
+        rel="next" link, same as find_target_posters does for poster
+        listings), stopping as soon as a page contains at least one
+        candidate matching target_year — or once there are no more pages.
+
+        For most titles the plain search() already finds the right
+        candidate on page 1. This exists for the rare case of an
+        extremely generic title (e.g. "RED", "Mother!") where TPDb's
+        catalog has dozens of unrelated same-named entries spread across
+        many pages with no useful sort order — confirmed via manual
+        check that "RED" alone has 28 such pages. There's no shortcut to
+        guessing which page has the real one, so this just keeps going
+        until it finds a year match or genuinely runs out of pages,
+        rather than gambling on an early cutoff.
+
+        Only call this after a plain search() has already come back with
+        zero candidates for target_year — it's meaningfully more
+        expensive (up to max_pages requests) and only worth paying for
+        when the cheap path has already failed.
+
+        Returns (candidates, pages_fetched) — pages_fetched is 1-indexed,
+        i.e. the page the loop stopped on (either the one where a year
+        match turned up, or the last page that exists if it never did).
+        """
+        section = "movies" if category.lower().startswith("movie") else "shows"
+        url = f"{config.TPDB_BASE}/search"
+        params = {"term": title, "section": section}
+
+        all_candidates = []
+        seen = set()
+        pages_fetched = 0
+
+        for page_num in range(max_pages):
+            soup = self._get_soup(url, params=params if page_num == 0 else None)
+            pages_fetched = page_num + 1
+
+            container = soup.select_one("#tabs-active") or soup
+            page_candidates = []
+            for a in container.find_all("a", href=True):
+                if not POSTERS_LINK_RE.match(_path(a["href"])):
+                    continue
+                c = _parse_result_link(a)
+                if c["url"] not in seen:
+                    seen.add(c["url"])
+                    all_candidates.append(c)
+                    page_candidates.append(c)
+
+            if target_year and any(c.get("year") == target_year for c in page_candidates):
+                break
+
+            next_link = soup.select_one('a.page-link[rel="next"]')
+            if next_link and next_link.get("href"):
+                url = urljoin(config.TPDB_BASE, str(next_link["href"]))
+            else:
+                break
+
+        return all_candidates, pages_fetched
+
     def get_poster_image_url(self, poster_detail_url):
         """
         Given an individual /poster/<id> detail page URL, return its
@@ -218,4 +278,4 @@ def _parse_result_link(a_tag):
         year = int(year_str) if year_str != "N/A" else None
     else:
         title, year = text, None
-    return {"title": title, "year": year, "url": urljoin(config.TPDB_BASE, a_tag["href"])}
+    return {"title": title, "year": year, "url": urljoin(config.TPDB_BASE, str(a_tag["href"]))}
