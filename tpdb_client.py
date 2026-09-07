@@ -37,6 +37,22 @@ import config
 POSTERS_LINK_RE = re.compile(r"^/posters/\d+/?$")
 TITLE_YEAR_RE = re.compile(r"^(.*?)\s*\((\d{4}|N/A)\)\s*$")
 _SUBTITLE_SPLIT_RE = re.compile(r"\s*:\s*|\s+-\s+")
+_TRAILING_YEAR_RE = re.compile(r"\s*\(\d{4}\)\s*$")
+
+
+def strip_trailing_year(title):
+    """
+    Some Plex/TMDB titles bake a disambiguation year directly into the
+    title field itself — e.g. "The Continental (2023)" rather than just
+    "The Continental" with the year stored separately (this happens when
+    the plain title collides with something else in TMDB's catalog).
+    That parenthetical year is pure noise for TPDb's search: Plex already
+    gives us the real year in its own field, and the extra "(YYYY)" text
+    confuses TPDb's relevance ranking the same way an overly-long
+    subtitle does (see shortened_title). Strip it before searching.
+    Returns the title unchanged if there's no trailing "(YYYY)".
+    """
+    return _TRAILING_YEAR_RE.sub("", title).strip()
 
 
 def shortened_title(title):
@@ -175,7 +191,7 @@ class TPDbClient:
                     found.append((uploader, overlay.get("data-poster-id"), image_url))
 
             next_link = soup.select_one('a.page-link[rel="next"]')
-            url = urljoin(config.TPDB_BASE, next_link["href"]) if (
+            url = urljoin(config.TPDB_BASE, str(next_link["href"])) if (
                 next_link and next_link.get("href")
             ) else None
 

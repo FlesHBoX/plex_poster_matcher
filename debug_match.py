@@ -20,15 +20,19 @@ title, year, category = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 
 tpdb = TPDbClient()
 
-short = tc.shortened_title(title)
+search_title = tc.strip_trailing_year(title)
+if search_title != title:
+    print(f"Title has a trailing (YYYY) baked in -> searching with that stripped: {search_title!r}")
+
+short = tc.shortened_title(search_title)
 if short:
     print(f"Title has a subtitle separator -> also trying shortened search term: {short!r}")
-candidates = tpdb.search_with_fallback(title, category)
+candidates = tpdb.search_with_fallback(search_title, category)
 
 print(f"Plex title: {title!r} ({year})")
 print(f"TPDb returned {len(candidates)} combined raw candidate(s) for section={category}:\n")
 
-norm_target = matcher._normalize(title)
+norm_target = matcher._normalize(search_title)
 exact_year = [c for c in candidates if c.get("year") == year]
 near_year = [
     c for c in candidates
@@ -56,20 +60,22 @@ if not scored or scored[0][0] < matcher.TITLE_SCORE_THRESHOLD:
         print(f"  {score:6.1f}  {c['title']!r} ({c['year']})  {c['url']}")
 
 print()
-match, ambiguous, tied = matcher.best_match(title, year, candidates)
+match, ambiguous, tied = matcher.best_match(search_title, year, candidates)
 print(f"RESULT: match={match}, ambiguous={ambiguous}, tied_count={len(tied)}")
 
 if ambiguous:
     print(f"\nTied candidates ({len(tied)}) — checking each one's actual poster listing")
     print(f"for a target-uploader ({', '.join(config.TPDB_USERS)}) poster, same as main.py does:\n")
     for cand in tied:
+        error_msg = None
         try:
             found = tpdb.find_target_posters(cand["url"], config.TPDB_USERS)
         except Exception as exc:
             found = None
+            error_msg = str(exc)
         print(f"  {cand['url']}")
         if found is None:
-            print(f"    -> ERROR checking this candidate: {exc}")
+            print(f"    -> ERROR checking this candidate: {error_msg}")
         elif not found:
             print(f"    -> no target-uploader poster found (0 results)")
         else:

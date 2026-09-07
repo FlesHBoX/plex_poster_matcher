@@ -73,7 +73,7 @@ import config
 import image_store
 import matcher
 import plex_client
-from tpdb_client import TPDbClient
+from tpdb_client import TPDbClient, strip_trailing_year
 
 MATCHED_FIELDS = ["title", "year", "type", "uploader", "tpdb_url", "image_url", "local_file", "applied"]
 UNMATCHED_FIELDS = ["title", "year", "type", "status", "reason", "tpdb_url"]
@@ -85,12 +85,18 @@ def process_item(tpdb, plex_lib_item):
     year = plex_lib_item["year"]
     category = "movies" if plex_lib_item["type"] == "movie" else "shows"
 
+    # Some titles bake a disambiguation year straight into the title text
+    # itself (e.g. "The Continental (2023)") — that's noise for both the
+    # search query and the matcher, since we already have the real year
+    # separately from Plex.
+    search_title = strip_trailing_year(title)
+
     try:
-        candidates = tpdb.search_with_fallback(title, category)
+        candidates = tpdb.search_with_fallback(search_title, category)
     except Exception as exc:  # network hiccup, unexpected HTML, etc.
         return {"status": "error", "reason": f"search failed: {exc}"}
 
-    match, ambiguous, tied = matcher.best_match(title, year, candidates)
+    match, ambiguous, tied = matcher.best_match(search_title, year, candidates)
 
     if match is None:
         return {"status": "no_title_match", "reason": "no confident title match on TPDb"}
