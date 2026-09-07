@@ -1,0 +1,200 @@
+# Plex Poster Matcher (DarkMatte / djchrisallen)
+
+Scans your Plex movie and TV libraries, checks TheposterDB (TPDb) for a
+poster uploaded by specific users (default: DarkMatte, djchrisallen), and
+applies it directly to the matching Plex item — no manual downloading or
+file copying needed.
+
+## How it works
+
+Instead of scraping everything those two users have ever uploaded (tens
+of thousands of posters, loaded via JavaScript on their profile pages —
+would require a full headless browser), the script works in the other
+direction:
+
+1. Pull the list of movies/shows from your Plex library.
+2. For each one, search TPDb by title to find its poster page.
+3. Check that page's uploader list for DarkMatte / djchrisallen.
+4. If found, grab the poster's direct (unauthenticated) CDN image URL
+   and hand it to Plex's own `uploadPoster(url=...)` — your Plex server
+   fetches and applies it itself.
+
+This means it only ever makes as many requests as you have library
+items, not as many as they have uploads.
+
+## Setup
+
+```bash
+cd plex_poster_matcher
+python3 -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### Find your Plex token
+
+1. Sign in to Plex Web App.
+2. Open any item, click the `...` menu -> **Get Info** -> **View XML**.
+3. In the URL that opens, copy the value after `X-Plex-Token=`.
+
+(Or search "Finding an authentication token" on Plex's support site —
+the exact menu wording shifts between versions.)
+
+### Configure
+
+Copy `.env.example` to `.env` in this folder and fill in your real values:
+
+```
+PLEX_URL=http://localhost:32400
+PLEX_TOKEN=paste-your-token-here
+```
+
+`.env` is picked up automatically every time you run the script — no
+more re-typing `export`/`set` in every new terminal window, and it's
+listed in `.gitignore` so it's never committed if you push this project
+to GitHub (only `.env.example`, which has no real secrets, is meant to
+be committed).
+
+Optional overrides go in the same file (see the commented-out lines in
+`.env.example`): `TPDB_USERS`, `REQUEST_DELAY`, `OUTPUT_DIR`.
+
+If you'd rather not use a file at all, plain environment variables still
+work exactly as before and take priority over `.env`:
+
+```bash
+export PLEX_URL="http://localhost:32400"      # Windows: set PLEX_URL=...
+export PLEX_TOKEN="paste-your-token-here"
+```
+
+## Run it
+
+Always test first with a small slice and `--dry-run`:
+
+```bash
+python main.py --dry-run --limit 25
+```
+
+Check `output/matched.csv` and `output/unmatched.csv`, then run for real:
+
+```bash
+python main.py
+```
+
+If you need to stop partway through (Ctrl+C, laptop sleeps, network drops),
+just re-run the exact same command — it checks `output/matched.csv` and
+`output/unmatched.csv` and automatically skips anything already recorded
+there, picking up close to where it left off. Use `--restart` if you
+actually want to reprocess everything from scratch instead.
+
+### Going from a dry run to the real thing
+
+A `--dry-run` match gets recorded in `matched.csv` with `applied=False`.
+When you then run for real (no `--dry-run`), those items aren't just
+skipped — by default they get **re-verified through TPDb again** (so the
+match is still fresh, e.g. in case something changed since your dry run).
+If you'd rather trust the dry run's results as-is and skip re-hitting
+TPDb entirely, add `--use-cache`:
+
+```bash
+python main.py --use-cache
+```
+
+This applies straight from each item's cached local poster file (or the
+cached image URL, if the local file isn't there) and flips `applied` to
+`True` — no new TPDb requests for anything already matched. Much faster
+for a "I already reviewed the dry run, just apply it" pass over a large
+library.
+
+### Re-checking previously unmatched items
+
+Rather than manually deleting `unmatched.csv` to force a recheck (e.g.
+after a matcher fix, or once DarkMatte/djchrisallen upload something new),
+pass `--reverify`:
+
+```bash
+python main.py --reverify
+```
+
+This re-runs the full TPDb search for anything currently recorded as
+unmatched, while leaving anything already matched-and-applied completely
+untouched. Combine with `--dry-run` to preview what would change before
+committing to it.
+
+### Adding matches yourself
+
+For a title the scraper can't find (or gets wrong), don't fight the
+matcher — add a row to `output/manual.csv` instead:
+
+| title | year | type | source_url | local_file | note | applied |
+|---|---|---|---|---|---|---|
+
+Fill in **either** `source_url` **or** `local_file`, not both, and leave
+`applied` blank on a new row:
+
+- **`source_url`** — a specific poster's own TPDb page, e.g.
+  `https://theposterdb.com/poster/123456` (the *individual poster* page —
+  click through from a movie's listing page to get this URL, don't just
+  paste the listing page itself). This works for **any** uploader, not
+  just the ones in `TPDB_USERS` — handy for someone you found by browsing
+  manually. A direct image URL works here too, if you already have one.
+- **`local_file`** — path to an image file you made yourself (e.g. via
+  postertools.org), for a fully custom poster with no TPDb source at all.
+
+Run `main.py` as normal afterward (dry-run or real) — manual rows are
+picked up automatically at the start of every run, get applied to Plex,
+recorded into `matched.csv` (with your `note` as the uploader), and
+`applied` flips to `True` so that row won't be reprocessed again. A
+manual entry always overrides whatever the automated scraper found for
+that title. `--restart` never touches `manual.csv` — it's your own
+curated data, not something the script regenerates.
+
+Full library runs will take a while — with the default 1-second delay,
+~2,000 titles is roughly an hour or two, more when titles need extra
+lookups (subtitle fallback searches, resolving ties). Turn `REQUEST_DELAY`
+down at your own risk; it's there to be a considerate scraper, not a
+technical minimum.
+
+## Reading the output
+
+- **matched.csv** — every item where a poster from a target uploader was
+  found and applied (or would be, under `--dry-run`). `local_file` points
+  to a saved copy under `output/posters/movies/` or `output/posters/shows/`,
+  named `Title (Year).jpg` — handy for eyeballing whether matches look
+  right before trusting them at scale. Pass `--no-images` to skip saving
+  these and just rely on the `image_url` links instead.
+- **unmatched.csv** — everything skipped, with a `status`/`reason`:
+  - `no_title_match` — TPDb doesn't seem to have this title at all.
+  - `ambiguous` — multiple similarly-named TPDb entries; check `tpdb_url`
+    manually and adjust the title-matching threshold in `matcher.py` if
+    this happens a lot.
+  - `no_target_poster` — the title exists on TPDb, just nobody in your
+    target list has uploaded a poster for it.
+  - `error` — network hiccup or unexpected page structure; safe to
+    re-run, it'll just be retried from scratch (no state is cached).
+
+## Known limitations / things worth knowing
+
+- **This scrapes public HTML, not an official API** — TPDb doesn't offer
+  one. If the site's markup changes, the CSS/regex selectors in
+  `tpdb_client.py` may need updating. If you suddenly get zero matches
+  across the board, that's the first thing to check (view page source on
+  a search results page and a `/posters/<id>` page, compare to what the
+  code expects).
+- **Symbol-for-word title stunts aren't handled.** A small number of
+  movies use a symbol in place of a word in their official title (e.g.
+  "I ♥ Huckabees" instead of "I Heart Huckabees"). TPDb's search doesn't
+  associate the symbol with the word, so these won't be found even
+  though the matcher itself would score them fine if they showed up in
+  the candidate list. Rare enough not to be worth a dedicated fallback —
+  just search TPDb by hand for the handful of titles like this.
+- **Season-level posters aren't covered yet.** DarkMatte in particular
+  uploads a lot of per-season show posters (e.g. "Andor (2022) - Season
+  2"), which this script doesn't currently match against Plex's season
+  objects — it only sets the main show poster. Straightforward to add as
+  a follow-up if you want it.
+- **Collections aren't covered.** TPDb also has "Collection" posters
+  (e.g. "Marvel Cinematic Universe") that don't map to a single Plex
+  item; out of scope here.
+- Be a reasonable citizen of someone else's server: the default 1-second
+  delay between requests is intentional, and this is for personal-library
+  use, not for bulk-mirroring TPDb's catalog.

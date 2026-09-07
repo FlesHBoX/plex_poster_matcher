@@ -1,0 +1,18 @@
+# Secrets — never commit your real .env
+.env
+
+# Local environment
+venv/
+__pycache__/
+*.pyc
+
+# Editor-specific settings, not project files
+.vscode/
+.idea/
+
+# Generated output — this is your personal library's data, not project code
+output/
+
+# Diagnostic scratch files from debug_fetch.py / debug_match.py
+debug_search.html
+debug_listing.html
