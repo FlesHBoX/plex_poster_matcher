@@ -27,6 +27,14 @@ if search_title != title:
 short = tc.shortened_title(search_title)
 if short:
     print(f"Title has a subtitle separator -> also trying shortened search term: {short!r}")
+
+numeral = tc.numeral_variant_title(search_title)
+if numeral:
+    print(f"Title has a swappable number word/digit -> also trying: {numeral!r}")
+    numeral_short = tc.shortened_title(numeral)
+    if numeral_short:
+        print(f"  ...and its shortened form: {numeral_short!r}")
+
 candidates = tpdb.search_with_fallback(search_title, category)
 
 if not any(c.get("year") == year for c in candidates):

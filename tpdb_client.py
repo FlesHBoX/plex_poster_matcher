@@ -38,6 +38,53 @@ POSTERS_LINK_RE = re.compile(r"^/posters/\d+/?$")
 TITLE_YEAR_RE = re.compile(r"^(.*?)\s*\((\d{4}|N/A)\)\s*$")
 _SUBTITLE_SPLIT_RE = re.compile(r"\s*:\s*|\s+-\s+")
 _TRAILING_YEAR_RE = re.compile(r"\s*\(\d{4}\)\s*$")
+_WORD_RE = re.compile(r"\w+")
+
+# 0-20 covers the realistic range for numbers spelled out in movie/show
+# titles ("Fantastic Four", "Twelve Monkeys", "Ocean's Eleven", ...).
+_NUMBER_WORDS = {
+    "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+    "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
+    "10": "ten", "11": "eleven", "12": "twelve", "13": "thirteen",
+    "14": "fourteen", "15": "fifteen", "16": "sixteen", "17": "seventeen",
+    "18": "eighteen", "19": "nineteen", "20": "twenty",
+}
+_WORD_NUMBERS = {v: k for k, v in _NUMBER_WORDS.items()}
+
+
+def numeral_variant_title(title):
+    """
+    Swaps spelled-out small numbers for digits, or digits for spelled-out
+    words, wherever a whole word/number token matches — e.g. "Fantastic
+    Four: First Steps" -> "Fantastic 4: First Steps".
+
+    This is a SEARCH-QUERY transform, not the same thing as matcher.py's
+    own number/word handling (which only helps once a candidate is
+    already in TPDb's returned results). Discovered via "Fantastic Four:
+    First Steps" — Plex/everywhere else spells out "Four", but TPDb and
+    TMDB actually store the title with the numeral "4". Searching TPDb
+    for the spelled-out version returns nothing useful; searching for
+    "Fantastic 4" finds it immediately. Matcher-side normalization can't
+    fix this because it never gets the chance — the real entry never
+    shows up in the search results to be scored in the first place.
+
+    Returns None if the title has no swappable number word/digit in it.
+    """
+    changed = [False]
+
+    def repl(m):
+        word = m.group(0)
+        lower = word.lower()
+        if lower in _WORD_NUMBERS:
+            changed[0] = True
+            return _WORD_NUMBERS[lower]
+        if word in _NUMBER_WORDS:
+            changed[0] = True
+            return _NUMBER_WORDS[word]
+        return word
+
+    result = _WORD_RE.sub(repl, title)
+    return result if changed[0] else None
 
 
 def strip_trailing_year(title):
@@ -121,17 +168,43 @@ class TPDbClient:
 
     def search_with_fallback(self, title, category):
         """
-        search(), plus: if the title has a colon/dash subtitle separator,
-        also search using just the part before it, and merge in any new
-        results. Caller still does its own title/year matching against
-        the combined list — this only widens the candidate pool.
+        search(), plus two widening strategies, each merged into the
+        combined result set if they turn up anything new:
+
+        1. If the title has a colon/dash subtitle separator, also search
+           using just the part before it (handles TPDb ranking a long,
+           subtitle-heavy query poorly — see shortened_title).
+        2. If the title has a spelled-out number or digit that could go
+           the other way, also search with that swapped (handles TPDb
+           storing "Fantastic 4" where Plex has "Fantastic Four" — see
+           numeral_variant_title). Also tries the SHORTENED version of
+           that swapped title, since both problems can apply to the same
+           title at once (exactly the "Fantastic Four: First Steps" case
+           this was built for).
+
+        Caller still does its own title/year matching against the
+        combined list — this only widens the candidate pool.
         """
         candidates = self.search(title, category)
+        seen = {c["url"] for c in candidates}
+
+        def _add(term):
+            more = self.search(term, category)
+            new = [c for c in more if c["url"] not in seen]
+            candidates.extend(new)
+            seen.update(c["url"] for c in new)
+
         short = shortened_title(title)
         if short:
-            more = self.search(short, category)
-            seen = {c["url"] for c in candidates}
-            candidates = candidates + [c for c in more if c["url"] not in seen]
+            _add(short)
+
+        numeral = numeral_variant_title(title)
+        if numeral:
+            _add(numeral)
+            numeral_short = shortened_title(numeral)
+            if numeral_short:
+                _add(numeral_short)
+
         return candidates
 
     def search_deep_until_year(self, title, category, target_year, max_pages=40):
