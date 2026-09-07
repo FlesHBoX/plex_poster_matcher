@@ -182,11 +182,20 @@ def _load_report(path):
 
 
 def _rewrite_report(path, fieldnames, rows_by_key):
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows_by_key.values():
-            writer.writerow(row)
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows_by_key.values():
+                writer.writerow(row)
+    except PermissionError:
+        sys.exit(
+            f"\nCouldn't write to {path} — Windows says permission denied, which "
+            "almost always means the file is open in another program (Excel, "
+            "Notepad, etc. take an exclusive lock on CSVs).\n"
+            "Close it there and re-run the exact same command — nothing has been "
+            "lost, this will pick back up from here."
+        )
 
 
 def _save_poster_locally(title, year, item_type, image_url, session):
