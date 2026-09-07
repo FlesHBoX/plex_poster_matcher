@@ -22,6 +22,11 @@ Usage:
                                     # multi_options.json (see below) —
                                     # never touches Plex, matched.csv, or
                                     # downloaded images
+    python main.py --new-user NAME # add NAME to TPDB_USERS (saved to
+                                    # .env) and quickly check it against
+                                    # everything already processed, reusing
+                                    # each title's known TPDb page instead
+                                    # of a full re-search
 
 Output (rewritten after every change, not just at the end, so progress is
 never lost to an interruption):
@@ -327,6 +332,167 @@ def backfill_multi_options(tpdb, matched_by_key, library_by_key, multi_options_p
     print(f"\nDone. {cataloged} title(s) newly cataloged with multiple options.")
 
 
+ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def add_user_to_env(new_username, env_path=ENV_PATH):
+    """
+    Adds new_username to the TPDB_USERS line in .env — appended at the
+    end, i.e. lowest priority, so it never silently outranks an existing
+    match unless TPDB_USERS is manually reordered afterward. Creates the
+    line (and the file itself) if neither already exists, preserving
+    every other line untouched. Returns the full updated user list.
+    """
+    current_users = list(config.TPDB_USERS)  # whatever's currently in effect
+    lines = []
+    found = False
+
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            lines = f.readlines()
+
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("TPDB_USERS=") and not stripped.startswith("#"):
+            found = True
+            existing = [u.strip() for u in stripped.split("=", 1)[1].split(",") if u.strip()]
+            if new_username.lower() not in [u.lower() for u in existing]:
+                existing.append(new_username)
+            new_lines.append(f"TPDB_USERS={','.join(existing)}\n")
+            current_users = existing
+        else:
+            new_lines.append(line)
+
+    if not found:
+        if new_username.lower() not in [u.lower() for u in current_users]:
+            current_users = current_users + [new_username]
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] += "\n"
+        new_lines.append(f"TPDB_USERS={','.join(current_users)}\n")
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    return current_users
+
+
+def process_new_user(tpdb, new_username, matched_by_key, unmatched_by_key, multi_options_by_key,
+                      library_by_key, matched_path, unmatched_path, multi_options_path,
+                      no_images, dry_run):
+    """
+    Fast path for adding an uploader after the library's already been
+    processed: rather than re-running the full search pipeline (the most
+    expensive and failure-prone part) for every title, reuse the TPDb
+    listing URL already recorded and just check THAT ONE URL for the new
+    user's poster.
+
+    - Already-matched titles: a hit gets cataloged as an additional
+      option (multi_options.json), never auto-applied over the existing
+      pick — a newly added user is presumed lower priority unless
+      TPDB_USERS is manually reordered.
+    - Previously "no_target_poster" titles: a hit here is a genuine new
+      match (nothing was covering this title before), so it's applied
+      immediately, same as a fresh discovery.
+    - "ambiguous" and "no_title_match" titles have no single reliable URL
+      to reuse and are skipped — run --reverify afterward to reconsider
+      those (it'll include the new user automatically, since by then
+      they're in TPDB_USERS).
+    """
+    checked = 0
+    new_matches = 0
+    new_options = 0
+    skipped_no_url = 0
+
+    matched_keys = list(matched_by_key.keys())
+    print(f"Checking {len(matched_keys)} already-matched title(s) for a poster from {new_username}...")
+    for i, key in enumerate(matched_keys, 1):
+        row = matched_by_key[key]
+        tpdb_url = row.get("tpdb_url", "")
+        title, year = row["title"], row["year"]
+        label = f"{title} ({year})" if year else title
+        if not tpdb_url:
+            skipped_no_url += 1
+            continue
+
+        print(f"[{i}/{len(matched_keys)}] {label} ...", end=" ", flush=True)
+        try:
+            found = tpdb.find_target_posters(tpdb_url, [new_username])
+        except Exception as exc:
+            print(f"error checking: {exc}")
+            continue
+        checked += 1
+        if not found:
+            print("no poster from this user")
+            continue
+
+        new_opts = [{"uploader": u, "poster_id": pid, "image_url": img} for u, pid, img in found]
+        existing = multi_options_by_key.get(key)
+        if existing:
+            existing_ids = {o["poster_id"] for o in existing["options"]}
+            added = [o for o in new_opts if o["poster_id"] not in existing_ids]
+            if added:
+                existing["options"].extend(added)
+                multi_options_by_key[key] = existing
+        else:
+            multi_options_by_key[key] = {
+                "title": title, "year": year, "type": row["type"],
+                "tpdb_url": tpdb_url,
+                "chosen_image_url": row["image_url"],
+                "options": [{"uploader": row["uploader"], "poster_id": "", "image_url": row["image_url"]}] + new_opts,
+            }
+        _rewrite_multi_options(multi_options_path, multi_options_by_key)
+        new_options += 1
+        print(f"found a {new_username} option -- see overrides.html")
+
+    no_target_items = [(k, r) for k, r in unmatched_by_key.items() if r.get("status") == "no_target_poster"]
+    print(f"\nChecking {len(no_target_items)} previously-unmatched title(s) (no target poster) "
+          f"for a poster from {new_username}...")
+    for i, (key, row) in enumerate(no_target_items, 1):
+        tpdb_url = row.get("tpdb_url", "")
+        title, year, item_type = row["title"], row["year"], row["type"]
+        label = f"{title} ({year})" if year else title
+        if not tpdb_url:
+            skipped_no_url += 1
+            continue
+        lib_item = library_by_key.get(key)
+        if lib_item is None:
+            continue
+
+        print(f"[{i}/{len(no_target_items)}] {label} ...", end=" ", flush=True)
+        try:
+            found = tpdb.find_target_posters(tpdb_url, [new_username])
+        except Exception as exc:
+            print(f"error checking: {exc}")
+            continue
+        checked += 1
+        if not found:
+            print("still nothing")
+            continue
+
+        uploader, poster_id, image_url = found[0]
+        plex_client.apply_poster(lib_item["item"], image_url=image_url, dry_run=dry_run)
+        saved_path = ""
+        if not no_images:
+            saved_path = _save_poster_locally(title, year, item_type, image_url, tpdb.session)
+        matched_by_key[key] = {
+            "title": title, "year": year, "type": item_type,
+            "uploader": uploader, "tpdb_url": tpdb_url, "image_url": image_url,
+            "local_file": saved_path, "applied": not dry_run,
+        }
+        del unmatched_by_key[key]
+        _rewrite_report(matched_path, MATCHED_FIELDS, matched_by_key)
+        _rewrite_report(unmatched_path, UNMATCHED_FIELDS, unmatched_by_key)
+        new_matches += 1
+        print(f"NEW MATCH ({uploader})")
+
+    print(f"\nDone. Checked {checked} title(s) with a known TPDb page.")
+    print(f"{new_matches} new match(es), {new_options} title(s) gained an additional option.")
+    if skipped_no_url:
+        print(f"({skipped_no_url} title(s) skipped — no TPDb page on record; "
+              "run --reverify to reconsider those, it'll include the new user automatically.)")
+
+
 def _save_poster_locally(title, year, item_type, image_url, session):
     """Download a matched poster to output/posters/<movies|shows>/, return
     the saved path (or "" on failure — caller treats that as no local copy)."""
@@ -477,6 +643,12 @@ def main():
              "(for a library that was fully processed before that feature existed). "
              "Never touches Plex, matched.csv, or downloaded images.",
     )
+    parser.add_argument(
+        "--new-user", metavar="USERNAME",
+        help="Add USERNAME to TPDB_USERS (saved to .env) and quickly check it against "
+             "everything already processed, reusing each title's known TPDb page instead "
+             "of a full re-search.",
+    )
     args = parser.parse_args()
 
     config.validate()
@@ -507,6 +679,23 @@ def main():
     if args.limit:
         library_items = library_items[: args.limit]
     print(f"Found {len(library_items)} movies/shows in your Plex library.")
+
+    if args.new_user:
+        updated_users = add_user_to_env(args.new_user)
+        config.TPDB_USERS = updated_users
+        print(f"Added {args.new_user!r} to TPDB_USERS (saved to .env). Full list now: {', '.join(updated_users)}")
+        library_by_key = {
+            _item_key(item["title"], item["year"], item["type"]): item for item in library_items
+        }
+        tpdb = TPDbClient()
+        if args.dry_run:
+            print("(--dry-run: nothing will actually be applied to Plex)")
+        process_new_user(
+            tpdb, args.new_user, matched_by_key, unmatched_by_key, multi_options_by_key,
+            library_by_key, matched_path, unmatched_path, multi_options_path,
+            args.no_images, args.dry_run,
+        )
+        return
 
     if args.backfill_multi_options:
         library_by_key = {

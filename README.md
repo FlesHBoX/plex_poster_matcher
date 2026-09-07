@@ -184,6 +184,31 @@ python main.py                       # normal run — this also writes
 python generate_overrides_page.py    # builds output/overrides.html
 ```
 
+### Adding a new uploader without re-running everything
+
+```bash
+python main.py --new-user SomeUploader
+```
+
+This does two things: adds `SomeUploader` to `TPDB_USERS` in `.env`
+(appended at the end — lowest priority, so it can never silently outrank
+an uploader you already trust more, unless you manually reorder the list
+afterward), then checks that one uploader against everything you've
+already processed — but cheaply, by reusing each title's TPDb page you
+already found instead of repeating the full search from scratch.
+
+What that means for each title:
+- **Already matched** — if `SomeUploader` also has a poster there, it's
+  added to `multi_options.json` as an extra option (review it via
+  `overrides.html`), never auto-applied over your existing pick.
+- **Previously unmatched with no target-uploader poster** — if
+  `SomeUploader` has one, that's a genuine new match, applied
+  immediately.
+- **Ambiguous or never found on TPDb at all** — skipped; there's no
+  single reliable page to reuse for these. Run `--reverify` afterward to
+  reconsider them (it'll include the new uploader automatically, since
+  by then they're already in `TPDB_USERS`).
+
 Open `output/overrides.html` in a browser (double-click it, no server
 needed). Click a title to see every option with the uploader's name
 underneath; the one the script picked is marked "default." Click a
