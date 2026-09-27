@@ -20,6 +20,36 @@ def safe_filename(title, year, ext):
     return f"{name}{ext}"
 
 
+def poster_dir(output_dir, title, year, item_type, collection_name=None):
+    """
+    Where a poster for this item should live.
+    Movies: flat output_dir/posters/movies/, or a collection subfolder
+    output_dir/posters/movies/<Collection Name>/ when collection_name is
+    given (only meaningful when the movie belongs to exactly one Plex
+    collection, or one has been manually chosen — see main.py).
+    Shows: one subfolder per show, output_dir/posters/shows/<Show (Year)>/
+    — so a show's season posters (once fetched) can sit alongside its
+    main poster in the same place, e.g.:
+        output/posters/shows/Ted Lasso (2020)/Ted Lasso (2020).jpg
+        output/posters/shows/Ted Lasso (2020)/Season 1.jpg
+    """
+    if item_type == "movie":
+        base = os.path.join(output_dir, "posters", "movies")
+        if collection_name:
+            return os.path.join(base, safe_filename(collection_name, None, ""))
+        return base
+    show_folder = safe_filename(title, year, "")
+    return os.path.join(output_dir, "posters", "shows", show_folder)
+
+
+def season_filename(season_number, ext):
+    """0 -> 'Specials.jpg', 1 -> 'Season 1.jpg', etc. — sits alongside the
+    main poster inside that show's own subfolder, so no need to repeat
+    the show name/year in this one."""
+    label = "Specials" if season_number == 0 else f"Season {season_number}"
+    return f"{label}{ext}"
+
+
 def ext_from_url(url):
     path = url.split("?", 1)[0]
     _, ext = os.path.splitext(path)

@@ -39,6 +39,44 @@ TITLE_YEAR_RE = re.compile(r"^(.*?)\s*\((\d{4}|N/A)\)\s*$")
 _SUBTITLE_SPLIT_RE = re.compile(r"\s*:\s*|\s+-\s+")
 _TRAILING_YEAR_RE = re.compile(r"\s*\(\d{4}\)\s*$")
 _WORD_RE = re.compile(r"\w+")
+_SEASON_SUFFIX_RE = re.compile(r"^(.*?)\s*-\s*(Season\s+(\d+)|Specials)\s*$", re.IGNORECASE)
+_POSTERS_ID_RE = re.compile(r"/posters/(\d+)")
+_SHOW_ID_IN_IMAGE_RE = re.compile(r"/shows/(\d+)/")
+
+
+def _extract_posters_id(url):
+    """'https://theposterdb.com/posters/23859' -> '23859'."""
+    m = _POSTERS_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _extract_show_id_from_image(image_url):
+    """'.../shows/23859/season_1/....jpg' -> '23859'."""
+    m = _SHOW_ID_IN_IMAGE_RE.search(image_url)
+    return m.group(1) if m else None
+
+
+def parse_season_suffix(title):
+    """
+    Splits a TPDb poster title into (base_title, season_number) — TPDb
+    represents a show's season-specific posters as separate poster
+    entries within the SAME listing page as the main poster, sharing the
+    same uploader and "Set", distinguished only by a title suffix like
+    "Ted Lasso (2020) - Season 2" or "Ted Lasso (2020) - Specials".
+    There's no separate structured season field to read instead — the
+    suffix text is the only signal.
+
+    Returns (title, None) unchanged if there's no such suffix (a main
+    poster). season_number is 0 for "Specials" (matching Plex's own
+    convention), otherwise the parsed season integer.
+    """
+    m = _SEASON_SUFFIX_RE.match(title)
+    if not m:
+        return title, None
+    base_title = m.group(1).strip()
+    if m.group(3) is None:  # matched "Specials"
+        return base_title, 0
+    return base_title, int(m.group(3))
 
 # 0-20 covers the realistic range for numbers spelled out in movie/show
 # titles ("Fantastic Four", "Twelve Monkeys", "Ocean's Eleven", ...).
@@ -289,10 +327,26 @@ class TPDbClient:
         """
         Walk the (paginated) poster-listing page for a movie/show/collection
         and return every poster uploaded by one of target_users, as a list
-        of (uploader, poster_id, image_url) tuples. image_url is the direct
-        CDN URL taken straight from the listing page itself — TPDb embeds
-        it in the card's <picture> element, so no extra per-poster request
-        is needed to resolve it.
+        of dicts:
+            {"uploader", "poster_id", "image_url", "title", "season_number", "set_url"}
+
+        image_url is the direct CDN URL taken straight from the listing
+        page itself — TPDb embeds it in the card's <picture> element, so
+        no extra per-poster request is needed to resolve it.
+
+        season_number is None for a show's main/base poster, 0 for
+        "Specials", or the season number for a "- Season N" entry — TPDb
+        represents season-specific posters as separate same-uploader
+        entries on this SAME listing page, distinguished only by a title
+        suffix (see parse_season_suffix), not any separate structured
+        field. Caller is responsible for filtering to season_number is
+        None when only the main poster is wanted — this function returns
+        everything a target uploader has for this title, seasons
+        included, so the caller can choose to also apply/download those.
+
+        set_url (when present) is that poster's TPDb "Set" page — a
+        group of related posters (typically main + seasons) the SAME
+        uploader packaged together; may be None if it's not part of one.
         """
         found = []
         url = item_url
@@ -311,6 +365,15 @@ class TPDbClient:
                 if uploader.lower() not in wanted_lower:
                     continue
 
+                title_el = overlay.select_one(".poster-title-correction p.text-break")
+                raw_title = title_el.get_text(strip=True) if title_el else ""
+                base_title, season_number = parse_season_suffix(raw_title)
+
+                set_link = overlay.select_one("a.set_poster_count")
+                set_url = urljoin(config.TPDB_BASE, str(set_link["href"])) if (
+                    set_link and set_link.get("href")
+                ) else None
+
                 # The <picture> with the actual image is a sibling of this
                 # overlay div, inside their shared .hovereffect container.
                 container = overlay.find_parent(class_="hovereffect")
@@ -321,7 +384,109 @@ class TPDbClient:
                         image_url = jpeg_source["srcset"]
 
                 if image_url:
-                    found.append((uploader, overlay.get("data-poster-id"), image_url))
+                    found.append({
+                        "uploader": uploader,
+                        "poster_id": overlay.get("data-poster-id"),
+                        "image_url": image_url,
+                        "title": base_title,
+                        "season_number": season_number,
+                        "set_url": set_url,
+                    })
+
+            next_link = soup.select_one('a.page-link[rel="next"]')
+            url = urljoin(config.TPDB_BASE, str(next_link["href"])) if (
+                next_link and next_link.get("href")
+            ) else None
+
+        return found
+
+    def find_season_posters(self, set_url, expected_show_url=None, max_pages=5):
+        """
+        Fetch a poster's "Set" page and return every SEASON-SPECIFIC entry
+        found there (season_number != None).
+
+        Confirmed via real data that this is necessary, not optional: the
+        aggregate show listing page (what find_target_posters scrapes) only
+        shows ONE representative card per uploader per title — e.g. Ted
+        Lasso's /posters/243647 page has 24 cards, every one plainly titled
+        "Ted Lasso (2020)", zero season suffixes anywhere. Season-specific
+        variants only exist within that uploader's own Set page (the one
+        find_target_posters already captures as set_url per entry), so
+        getting them requires this separate fetch — they are NOT available
+        for free on the page already being scraped for the main poster.
+
+        ALSO confirmed via real data: a Set is not guaranteed to be scoped
+        to just one show. Some uploaders use a Set as a broad themed
+        collection spanning many different titles — e.g. one real Set
+        turned out to be DarkMatte's entire "Stephen King Universe"
+        collection (The Stand, Castle Rock, Mr. Mercedes, Under the Dome,
+        Haven, The Dead Zone, The Shining, and more, all in the SAME Set as
+        11.22.63). Without filtering, every season poster from every OTHER
+        show in that Set would incorrectly get treated as belonging to the
+        one we're actually looking for.
+
+        expected_show_url (recommended — pass the show's own /posters/<id>
+        page URL, e.g. match["url"]) guards against exactly that: each
+        entry's image URL embeds which show it actually belongs to
+        (.../shows/<id>/season_N/...), which is compared against the ID
+        parsed out of expected_show_url. Entries for a different show are
+        silently dropped. If expected_show_url isn't given, no filtering
+        happens — only safe to omit when you already know the Set is
+        single-show (e.g. confirmed manually).
+
+        Returns a list of dicts in the same shape as find_target_posters:
+        {"uploader", "poster_id", "image_url", "title", "season_number", "set_url"}.
+        Only season entries are returned (season_number is not None) —
+        the main poster itself, if it also appears on this page, is
+        skipped since the caller already has it.
+        """
+        expected_show_id = _extract_posters_id(expected_show_url) if expected_show_url else None
+        found = []
+        url = set_url
+
+        for _ in range(max_pages):
+            if not url:
+                break
+            soup = self._get_soup(url)
+
+            for overlay in soup.select("div.overlay.rounded-poster[data-poster-id]"):
+                uploader_link = overlay.select_one(".uploaded-by a")
+                uploader = uploader_link.get_text(strip=True) if uploader_link else ""
+
+                title_el = overlay.select_one(".poster-title-correction p.text-break")
+                raw_title = title_el.get_text(strip=True) if title_el else ""
+                base_title, season_number = parse_season_suffix(raw_title)
+                if season_number is None:
+                    continue  # the main poster itself — caller already has it
+
+                set_link = overlay.select_one("a.set_poster_count")
+                this_set_url = urljoin(config.TPDB_BASE, str(set_link["href"])) if (
+                    set_link and set_link.get("href")
+                ) else None
+
+                container = overlay.find_parent(class_="hovereffect")
+                image_url = None
+                if container:
+                    jpeg_source = container.select_one('picture source[type="image/jpeg"]')
+                    if jpeg_source and jpeg_source.get("srcset"):
+                        image_url = jpeg_source["srcset"]
+
+                if not image_url:
+                    continue
+
+                if expected_show_id:
+                    this_show_id = _extract_show_id_from_image(image_url)
+                    if this_show_id != expected_show_id:
+                        continue  # belongs to a different show sharing this same Set
+
+                found.append({
+                    "uploader": uploader,
+                    "poster_id": overlay.get("data-poster-id"),
+                    "image_url": image_url,
+                    "title": base_title,
+                    "season_number": season_number,
+                    "set_url": this_set_url,
+                })
 
             next_link = soup.select_one('a.page-link[rel="next"]')
             url = urljoin(config.TPDB_BASE, str(next_link["href"])) if (

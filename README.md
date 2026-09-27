@@ -228,8 +228,82 @@ changes (e.g. after a `--reverify` pass) to pick up newly-discovered
 multi-option titles — your existing selections aren't lost, since
 they live in the browser, not the generated file.
 
+### Poster organization on disk
 
-curated data, not something the script regenerates.
+Shows each get their own subfolder — `output/posters/shows/Show Name (Year)/` —
+containing the main poster plus any season posters found:
+
+```
+output/posters/shows/Ted Lasso (2020)/
+    Ted Lasso (2020).jpg
+    Season 1.jpg
+    Season 2.jpg
+    Specials.jpg
+```
+
+Season posters take one extra request per matched show: TPDb's aggregate
+show listing page only ever shows one representative card per uploader,
+never season-specific variants — those only exist within that uploader's
+own "Set" page. So after picking the main poster, the script follows its
+Set link and scans that page for entries titled with a "- Season N" or
+"- Specials" suffix. A show's art stays visually consistent rather than
+mixing styles, and a season Plex doesn't have yet (or numbers
+differently) is silently skipped, not an error.
+
+One real wrinkle worth knowing: a Set isn't guaranteed to be scoped to
+just one show. Some uploaders use a Set as a broad themed collection
+spanning many different titles — confirmed via a real example: one
+Set turned out to be an uploader's entire "Stephen King Universe"
+collection (The Stand, Castle Rock, Mr. Mercedes, Under the Dome, Haven,
+The Dead Zone, The Shining, and more, all bundled with 11.22.63 in the
+SAME Set). Each entry's image URL embeds which show it actually belongs
+to, so the script filters to just the show being matched — but this bug
+existed for a while before being caught, so if you ran `--backfill-seasons`
+before this fix, some shows may have picked up a completely unrelated
+show's season posters. Re-running `--backfill-seasons` re-applies correct
+posters over any wrong ones — safe to just do that again.
+
+Movies are organized by **Plex Collection** (the ones you've already
+set up in Plex itself — this doesn't use anything from TPDb):
+
+- No collection → flat `output/posters/movies/`
+- Exactly one collection → automatically filed into
+  `output/posters/movies/<Collection Name>/`
+- Two or more collections (e.g. Into the Spider-Verse is in Marvel,
+  Spider-Man, *and* Spider-Verse) → needs your call. A row appears in
+  `output/collection_choices.csv` listing the options; fill in
+  `chosen_collection` yourself, same idea as `manual.csv`. Leave it
+  blank and the poster just stays in the flat folder until you decide.
+  An invalid or since-removed collection name in that column is treated
+  the same as blank — it won't crash, it just stays flat.
+
+**If your library predates this feature:**
+
+```bash
+python migrate_show_folders.py --dry-run   # preview moving existing
+python migrate_show_folders.py             # flat show posters into the
+                                            # new per-show subfolders
+
+python migrate_movie_collections.py --dry-run   # preview organizing
+python migrate_movie_collections.py             # existing movie posters
+                                                 # by Plex Collection —
+                                                 # re-run after filling in
+                                                 # collection_choices.csv
+
+python main.py --backfill-seasons          # check already-matched shows
+                                            # for season posters, reusing
+                                            # their known TPDb page
+```
+
+`--backfill-seasons` is read-mostly for the main poster (it only applies
+season posters, never touches or re-applies the main one) and skips
+movies entirely. Safe to re-run if interrupted — re-applying an
+already-applied season poster is harmless.
+
+One assumption worth knowing: season matching relies on plexapi's
+`Season.index` being the season number, with `0` for Specials. This
+hasn't been verified against a live Plex server — if seasons aren't
+landing where expected, that's the first thing to check.
 
 Full library runs will take a while — with the default 1-second delay,
 ~2,000 titles is roughly an hour or two, more when titles need extra

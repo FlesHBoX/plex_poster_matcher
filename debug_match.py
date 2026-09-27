@@ -102,5 +102,44 @@ if ambiguous:
         elif not found:
             print(f"    -> no target-uploader poster found (0 results)")
         else:
-            for uploader, poster_id, image_url in found:
-                print(f"    -> {uploader}  (data-poster-id={poster_id})  {image_url}")
+            for f in found:
+                season_note = f"  [season {f['season_number']}]" if f["season_number"] is not None else ""
+                print(f"    -> {f['uploader']}  (data-poster-id={f['poster_id']}){season_note}  {f['image_url']}")
+
+elif match is not None:
+    print(f"\nChecking {match['url']} for a target-uploader ({', '.join(config.TPDB_USERS)}) poster...")
+    try:
+        found = tpdb.find_target_posters(match["url"], config.TPDB_USERS)
+    except Exception as exc:
+        found = None
+        print(f"  ERROR: {exc}")
+
+    if found is not None:
+        main_posters = [f for f in found if f["season_number"] is None]
+        if not main_posters:
+            print("  no target-uploader main poster found on this page")
+        else:
+            priority = {u.lower(): i for i, u in enumerate(config.TPDB_USERS)}
+            main_posters.sort(key=lambda f: priority.get(f["uploader"].lower(), 999))
+            chosen = main_posters[0]
+            print(f"  chosen main poster: {chosen['uploader']}  (data-poster-id={chosen['poster_id']})  {chosen['image_url']}")
+            if len(main_posters) > 1:
+                print(f"  ({len(main_posters)} target-uploader options total — see multi_options.json handling)")
+
+            if not category.lower().startswith("movie"):
+                if not chosen.get("set_url"):
+                    print("  chosen poster has no Set page -> no season posters possible")
+                else:
+                    print(f"\n  Fetching Set page for season posters: {chosen['set_url']}")
+                    try:
+                        season_posters = tpdb.find_season_posters(chosen["set_url"], expected_show_url=match["url"])
+                    except Exception as exc:
+                        print(f"    ERROR: {exc}")
+                        season_posters = []
+                    if not season_posters:
+                        print("    no season-suffixed entries found on this Set page")
+                    else:
+                        print(f"    found {len(season_posters)} season entr{'y' if len(season_posters)==1 else 'ies'}:")
+                        for sp in season_posters:
+                            print(f"      season {sp['season_number']}  {sp['uploader']}  "
+                                  f"(data-poster-id={sp['poster_id']})  title={sp['title']!r}  {sp['image_url']}")

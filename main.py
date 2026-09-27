@@ -90,6 +90,7 @@ from tpdb_client import TPDbClient, strip_trailing_year
 MATCHED_FIELDS = ["title", "year", "type", "uploader", "tpdb_url", "image_url", "local_file", "applied"]
 UNMATCHED_FIELDS = ["title", "year", "type", "status", "reason", "tpdb_url"]
 MANUAL_FIELDS = ["title", "year", "type", "source_url", "local_file", "note", "applied"]
+COLLECTION_CHOICE_FIELDS = ["title", "year", "type", "available_collections", "chosen_collection"]
 
 
 def process_item(tpdb, plex_lib_item):
@@ -129,20 +130,21 @@ def process_item(tpdb, plex_lib_item):
 
     if ambiguous:
         # Multiple candidates tied on title/year. Before giving up, check
-        # which of them actually has a poster from a target uploader —
-        # TPDb sometimes carries a duplicate or empty entry for the same
-        # title and year (e.g. "Ad Astra" has a real 2019 entry plus a
-        # content-free 2018 duplicate). That's not a REAL ambiguity if
-        # only one of the tied candidates has any relevant content; it
-        # only counts as one when two or more tied candidates each have
-        # their own target-uploader poster.
+        # which of them actually has a MAIN poster from a target uploader
+        # (season-specific entries don't count for this) — TPDb sometimes
+        # carries a duplicate or empty entry for the same title and year
+        # (e.g. "Ad Astra" has a real 2019 entry plus a content-free 2018
+        # duplicate). That's not a REAL ambiguity if only one of the tied
+        # candidates has any relevant content; it only counts as one when
+        # two or more tied candidates each have their own target-uploader
+        # main poster.
         resolved = []
         for cand in tied:
             try:
                 cand_found = tpdb.find_target_posters(cand["url"], config.TPDB_USERS)
             except Exception:
                 cand_found = []
-            if cand_found:
+            if any(f["season_number"] is None for f in cand_found):
                 resolved.append((cand, cand_found))
 
         if len(resolved) == 0:
@@ -164,32 +166,54 @@ def process_item(tpdb, plex_lib_item):
         except Exception as exc:
             return {"status": "error", "reason": f"poster listing failed: {exc}", "tpdb_url": match["url"]}
 
-        if not found:
+        if not any(f["season_number"] is None for f in found):
             return {
                 "status": "no_target_poster",
                 "reason": "matched on TPDb but no poster from target uploader(s)",
                 "tpdb_url": match["url"],
             }
 
+    # Only entries WITHOUT a season suffix are candidates for the main
+    # poster. In practice the aggregate listing page never seems to carry
+    # a season suffix at all (confirmed: Ted Lasso's page has 24 cards,
+    # every one plainly "Ted Lasso (2020)") — but this filter stays as a
+    # defensive safeguard in case some uploader's entry ever does, so a
+    # "Season 3" card could never be mistakenly applied as the main poster.
+    main_posters = [f for f in found if f["season_number"] is None]
+
     # Prefer whichever target uploader was listed first in config, in case
     # a title has posters from both.
     priority = {u.lower(): i for i, u in enumerate(config.TPDB_USERS)}
-    found.sort(key=lambda triple: priority.get(triple[0].lower(), 999))
-    uploader, poster_id, image_url = found[0]
+    main_posters.sort(key=lambda f: priority.get(f["uploader"].lower(), 999))
+    chosen = main_posters[0]
+
+    # Season-specific posters are NOT visible on the aggregate listing
+    # page itself — confirmed via real data, it only ever shows one
+    # representative card per uploader. They only exist within that
+    # uploader's own "Set" page, so getting them costs one extra request
+    # (only for shows, and only when the chosen poster actually has a
+    # set_url at all).
+    season_posters = []
+    if plex_lib_item["type"] == "show" and chosen.get("set_url"):
+        try:
+            season_posters = tpdb.find_season_posters(chosen["set_url"], expected_show_url=match["url"])
+        except Exception as exc:
+            print(f"  (warning: couldn't check for season posters: {exc})")
 
     return {
         "status": "matched",
-        "uploader": uploader,
+        "uploader": chosen["uploader"],
         # match["url"] is the title's poster-listing page — confirmed
         # working. We don't have a verified direct-permalink URL scheme
         # for an individual poster (data-poster-id doesn't necessarily
         # correspond to one), so we point here instead of guessing.
         "tpdb_url": match["url"],
-        "image_url": image_url,
-        # Every target-uploader poster found for this title, priority-order
-        # winner first — used to catalog cases where more than one option
-        # existed (see multi_options.json / overrides.html).
-        "options": found,
+        "image_url": chosen["image_url"],
+        # Every target-uploader MAIN poster found for this title, priority-
+        # order winner first — used to catalog cases where more than one
+        # option existed (see multi_options.json / overrides.html).
+        "options": main_posters,
+        "season_posters": season_posters,
     }
 
 
@@ -314,8 +338,8 @@ def backfill_multi_options(tpdb, matched_by_key, library_by_key, multi_options_p
                     # original run.
                     "chosen_image_url": matched_by_key[key]["image_url"],
                     "options": [
-                        {"uploader": u, "poster_id": pid, "image_url": img}
-                        for u, pid, img in options
+                        {"uploader": o["uploader"], "poster_id": o["poster_id"], "image_url": o["image_url"]}
+                        for o in options
                     ],
                 }
                 _rewrite_multi_options(multi_options_path, multi_options_by_key)
@@ -330,6 +354,70 @@ def backfill_multi_options(tpdb, matched_by_key, library_by_key, multi_options_p
         _save_checked_keys(checked_path, checked_keys)
 
     print(f"\nDone. {cataloged} title(s) newly cataloged with multiple options.")
+
+
+def backfill_seasons(tpdb, matched_by_key, library_by_key, no_images, dry_run):
+    """
+    Read-mostly pass over already-matched SHOWS (movies are skipped —
+    there's no such thing as a movie season), reusing each show's known
+    TPDb page to check for season-specific posters from the SAME
+    uploader already applied as the main poster, and applying/downloading
+    any found. For a library that was fully processed before season
+    support existed.
+
+    Not fully checkpointed like the other backfills (no separate
+    "already checked" file) — it's expected to be quick to re-run in
+    full, since it's naturally limited to however many shows you have,
+    not your whole library. Safe to just re-run if interrupted; anything
+    already applied gets the same poster re-applied, which is harmless.
+    """
+    show_keys = [k for k, r in matched_by_key.items() if r["type"] == "show"]
+    print(f"Checking {len(show_keys)} already-matched show(s) for season posters...")
+
+    total_seasons = 0
+    shows_with_seasons = 0
+    for i, key in enumerate(show_keys, 1):
+        row = matched_by_key[key]
+        title, year = row["title"], row["year"]
+        label = f"{title} ({year})" if year else title
+        tpdb_url = row.get("tpdb_url", "")
+        lib_item = library_by_key.get(key)
+
+        if not tpdb_url or lib_item is None:
+            continue
+
+        print(f"[{i}/{len(show_keys)}] {label} ...", end=" ", flush=True)
+        try:
+            found = tpdb.find_target_posters(tpdb_url, [row["uploader"]])
+        except Exception as exc:
+            print(f"error: {exc}")
+            continue
+
+        # Season posters aren't on this aggregate page at all (see
+        # find_season_posters' docstring) — find the main entry so we can
+        # get its set_url, then fetch that Set page separately.
+        main_entry = next((f for f in found if f["season_number"] is None), None)
+        if not main_entry or not main_entry.get("set_url"):
+            print("no Set found for this uploader")
+            continue
+
+        try:
+            season_posters = tpdb.find_season_posters(main_entry["set_url"], expected_show_url=tpdb_url)
+        except Exception as exc:
+            print(f"error checking Set page: {exc}")
+            continue
+
+        if not season_posters:
+            print("no season posters in this Set")
+            continue
+
+        applied = apply_season_posters(lib_item, season_posters, title, year, tpdb.session, no_images, dry_run)
+        print(f"[+{len(applied)} season poster(s)]")
+        if applied:
+            shows_with_seasons += 1
+        total_seasons += len(applied)
+
+    print(f"\nDone. {total_seasons} season poster(s) applied across {shows_with_seasons} show(s).")
 
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -398,6 +486,10 @@ def process_new_user(tpdb, new_username, matched_by_key, unmatched_by_key, multi
       to reuse and are skipped — run --reverify afterward to reconsider
       those (it'll include the new user automatically, since by then
       they're in TPDB_USERS).
+
+    Only checks MAIN posters, not season-specific ones — season posters
+    from a newly added user aren't picked up here; a normal run or
+    --backfill-seasons covers those.
     """
     checked = 0
     new_matches = 0
@@ -422,11 +514,12 @@ def process_new_user(tpdb, new_username, matched_by_key, unmatched_by_key, multi
             print(f"error checking: {exc}")
             continue
         checked += 1
-        if not found:
+        main_found = [f for f in found if f["season_number"] is None]
+        if not main_found:
             print("no poster from this user")
             continue
 
-        new_opts = [{"uploader": u, "poster_id": pid, "image_url": img} for u, pid, img in found]
+        new_opts = [{"uploader": f["uploader"], "poster_id": f["poster_id"], "image_url": f["image_url"]} for f in main_found]
         existing = multi_options_by_key.get(key)
         if existing:
             existing_ids = {o["poster_id"] for o in existing["options"]}
@@ -466,11 +559,13 @@ def process_new_user(tpdb, new_username, matched_by_key, unmatched_by_key, multi
             print(f"error checking: {exc}")
             continue
         checked += 1
-        if not found:
+        main_found = [f for f in found if f["season_number"] is None]
+        if not main_found:
             print("still nothing")
             continue
 
-        uploader, poster_id, image_url = found[0]
+        chosen = main_found[0]
+        uploader, poster_id, image_url = chosen["uploader"], chosen["poster_id"], chosen["image_url"]
         plex_client.apply_poster(lib_item["item"], image_url=image_url, dry_run=dry_run)
         saved_path = ""
         if not no_images:
@@ -493,13 +588,61 @@ def process_new_user(tpdb, new_username, matched_by_key, unmatched_by_key, multi
               "run --reverify to reconsider those, it'll include the new user automatically.)")
 
 
-def _save_poster_locally(title, year, item_type, image_url, session):
-    """Download a matched poster to output/posters/<movies|shows>/, return
-    the saved path (or "" on failure — caller treats that as no local copy)."""
-    subdir = "movies" if item_type == "movie" else "shows"
+def apply_season_posters(lib_item, season_posters, title, year, tpdb_session, no_images, dry_run):
+    """
+    Applies season-specific posters (the season_number-tagged entries
+    find_target_posters returns) to the corresponding Plex season
+    objects, and saves them locally alongside the main poster in that
+    show's own subfolder (image_store.poster_dir).
+
+    Assumes plexapi's Season.index gives the season number, with 0 for
+    Specials — this hasn't been verified against a live server, so if
+    seasons aren't landing correctly, that assumption is the first thing
+    to check.
+
+    Returns the list of season_posters actually applied (for reporting) —
+    anything whose season_number has no matching Plex season is silently
+    skipped, not an error.
+    """
+    if not season_posters:
+        return []
+
+    try:
+        plex_seasons = {s.index: s for s in lib_item["item"].seasons()}
+    except Exception as exc:
+        print(f"  (warning: couldn't list seasons in Plex: {exc})")
+        return []
+
+    applied = []
+    for sp in season_posters:
+        plex_season = plex_seasons.get(sp["season_number"])
+        if plex_season is None:
+            continue  # Plex doesn't have this season (or numbers it differently)
+
+        plex_client.apply_poster(plex_season, image_url=sp["image_url"], dry_run=dry_run)
+
+        if not no_images:
+            show_dir = image_store.poster_dir(config.OUTPUT_DIR, title, year, "show")
+            os.makedirs(show_dir, exist_ok=True)
+            ext = image_store.ext_from_url(sp["image_url"])
+            dest_path = os.path.join(show_dir, image_store.season_filename(sp["season_number"], ext))
+            try:
+                image_store.download_poster(tpdb_session, sp["image_url"], dest_path)
+            except Exception as exc:
+                print(f"  (warning: couldn't save season poster locally: {exc})")
+
+        applied.append(sp)
+
+    return applied
+
+
+def _save_poster_locally(title, year, item_type, image_url, session, collection_name=None):
+    """Download a matched poster to its standard location (see
+    image_store.poster_dir), return the saved path (or "" on failure —
+    caller treats that as no local copy)."""
     ext = image_store.ext_from_url(image_url)
     filename = image_store.safe_filename(title, year, ext)
-    dest_dir = os.path.join(config.OUTPUT_DIR, "posters", subdir)
+    dest_dir = image_store.poster_dir(config.OUTPUT_DIR, title, year, item_type, collection_name)
     os.makedirs(dest_dir, exist_ok=True)
     dest_path = os.path.join(dest_dir, filename)
     try:
@@ -510,14 +653,13 @@ def _save_poster_locally(title, year, item_type, image_url, session):
         return ""
 
 
-def _copy_poster_locally(title, year, item_type, src_path):
+def _copy_poster_locally(title, year, item_type, src_path, collection_name=None):
     """Copy a user-supplied local image (manual.csv's local_file) into the
-    standard output/posters/<movies|shows>/ location, same naming scheme
+    standard location (see image_store.poster_dir), same naming scheme
     as everything else. Returns the new path, or "" on failure."""
-    subdir = "movies" if item_type == "movie" else "shows"
     ext = os.path.splitext(src_path)[1] or ".jpg"
     filename = image_store.safe_filename(title, year, ext)
-    dest_dir = os.path.join(config.OUTPUT_DIR, "posters", subdir)
+    dest_dir = image_store.poster_dir(config.OUTPUT_DIR, title, year, item_type, collection_name)
     os.makedirs(dest_dir, exist_ok=True)
     dest_path = os.path.join(dest_dir, filename)
     try:
@@ -528,8 +670,73 @@ def _copy_poster_locally(title, year, item_type, src_path):
         return ""
 
 
+def resolve_movie_collection_folder(collections, key, collection_choices_by_key):
+    """
+    Decides which (if any) Plex Collection subfolder a movie's poster
+    should be filed under:
+      - no collections            -> None (flat movies/ folder)
+      - exactly one collection    -> that collection, automatically
+      - two or more collections   -> whatever's recorded in
+                                      collection_choices.csv's
+                                      chosen_collection column for this
+                                      movie, or None (stays flat) if
+                                      that's still blank/unresolved
+    """
+    if not collections:
+        return None
+    if len(collections) == 1:
+        return collections[0]
+    row = collection_choices_by_key.get(key)
+    chosen = (row or {}).get("chosen_collection", "").strip()
+    if chosen and chosen in collections:
+        return chosen
+    return None
+
+
+def sync_collection_choice_row(collection_choices_by_key, key, title, year, item_type, collections):
+    """
+    Keeps collection_choices.csv in sync for a movie with 2+ collections:
+    adds a fresh row (chosen_collection blank, needing a decision) if
+    this is the first time we've seen it, or refreshes available_collections
+    on an existing row without ever touching a chosen_collection value the
+    user already filled in. Returns True if the in-memory dict changed
+    (caller decides whether/when to rewrite the file).
+    """
+    existing = collection_choices_by_key.get(key)
+    available = ";".join(collections)
+    if existing:
+        if existing.get("available_collections") != available:
+            existing["available_collections"] = available
+            collection_choices_by_key[key] = existing
+            return True
+        return False
+    collection_choices_by_key[key] = {
+        "title": title,
+        "year": year,
+        "type": item_type,
+        "available_collections": available,
+        "chosen_collection": "",
+    }
+    return True
+
+
+def determine_movie_collection_folder(key, title, year, collections, collection_choices_by_key, collection_choices_path):
+    """
+    Convenience wrapper combining sync_collection_choice_row +
+    resolve_movie_collection_folder: syncs collection_choices.csv (only
+    rewriting the file if something actually changed) and returns the
+    folder name to use (or None for flat), in one call. Only meaningful
+    for movies — pass collections=[] for shows to always get None back.
+    """
+    if len(collections) > 1:
+        if sync_collection_choice_row(collection_choices_by_key, key, title, year, "movie", collections):
+            _rewrite_report(collection_choices_path, COLLECTION_CHOICE_FIELDS, collection_choices_by_key)
+    return resolve_movie_collection_folder(collections, key, collection_choices_by_key)
+
+
 def process_manual_entries(tpdb, library_by_key, matched_by_key, unmatched_by_key,
-                            matched_path, unmatched_path, manual_path, no_images, dry_run):
+                            matched_path, unmatched_path, manual_path, no_images, dry_run,
+                            collection_choices_by_key=None, collection_choices_path=None):
     """
     Apply anything new in output/manual.csv. A manual entry always
     overrides whatever the automated pipeline found for that title.
@@ -585,12 +792,20 @@ def process_manual_entries(tpdb, library_by_key, matched_by_key, unmatched_by_ke
 
         plex_client.apply_poster(lib_item["item"], image_url=image_url, filepath=src_local_path, dry_run=dry_run)
 
+        collection_name = None
+        if item_type == "movie" and collection_choices_by_key is not None:
+            movie_collections = plex_client.get_movie_collections(lib_item["item"])
+            collection_name = determine_movie_collection_folder(
+                key, title, year, movie_collections,
+                collection_choices_by_key, collection_choices_path,
+            )
+
         saved_path = ""
         if not no_images:
             if src_local_path:
-                saved_path = _copy_poster_locally(title, year, item_type, src_local_path)
+                saved_path = _copy_poster_locally(title, year, item_type, src_local_path, collection_name)
             elif image_url:
-                saved_path = _save_poster_locally(title, year, item_type, image_url, tpdb.session)
+                saved_path = _save_poster_locally(title, year, item_type, image_url, tpdb.session, collection_name)
 
         matched_by_key[key] = {
             "title": title,
@@ -649,6 +864,12 @@ def main():
              "everything already processed, reusing each title's known TPDb page instead "
              "of a full re-search.",
     )
+    parser.add_argument(
+        "--backfill-seasons", action="store_true",
+        help="Read-mostly pass over already-matched shows to apply season-specific posters "
+             "from the same uploader as the main poster (for a library processed before season "
+             "support existed). Movies are skipped. Reuses each show's known TPDb page.",
+    )
     args = parser.parse_args()
 
     config.validate()
@@ -659,19 +880,24 @@ def main():
     manual_path = os.path.join(config.OUTPUT_DIR, "manual.csv")
     multi_options_path = os.path.join(config.OUTPUT_DIR, "multi_options.json")
     checked_path = os.path.join(config.OUTPUT_DIR, "multi_options_checked.json")
+    collection_choices_path = os.path.join(config.OUTPUT_DIR, "collection_choices.csv")
 
     if args.restart:
         for p in (matched_path, unmatched_path):
             if os.path.exists(p):
                 os.remove(p)
-        # manual.csv is never cleared by --restart — it's your own curated data.
+        # manual.csv and collection_choices.csv are never cleared by
+        # --restart — they're your own curated data.
 
     if not os.path.exists(manual_path):
         _rewrite_report(manual_path, MANUAL_FIELDS, {})
+    if not os.path.exists(collection_choices_path):
+        _rewrite_report(collection_choices_path, COLLECTION_CHOICE_FIELDS, {})
 
     matched_by_key = _load_report(matched_path)
     unmatched_by_key = _load_report(unmatched_path)
     multi_options_by_key = _load_multi_options(multi_options_path)
+    collection_choices_by_key = _load_report(collection_choices_path)
 
     print("Connecting to Plex...")
     plex = plex_client.connect()
@@ -709,6 +935,16 @@ def main():
         )
         return
 
+    if args.backfill_seasons:
+        library_by_key = {
+            _item_key(item["title"], item["year"], item["type"]): item for item in library_items
+        }
+        tpdb = TPDbClient()
+        if args.dry_run:
+            print("(--dry-run: nothing will actually be applied to Plex)")
+        backfill_seasons(tpdb, matched_by_key, library_by_key, args.no_images, args.dry_run)
+        return
+
     print(f"Looking for posters from: {', '.join(config.TPDB_USERS)}")
     if args.dry_run:
         print("(--dry-run: nothing will actually be applied to Plex)")
@@ -725,6 +961,7 @@ def main():
     manual_applied = process_manual_entries(
         tpdb, library_by_key, matched_by_key, unmatched_by_key,
         matched_path, unmatched_path, manual_path, args.no_images, args.dry_run,
+        collection_choices_by_key, collection_choices_path,
     )
     if manual_applied:
         print(f"{manual_applied} manual.csv entr{'y' if manual_applied == 1 else 'ies'} applied this run.")
@@ -785,11 +1022,30 @@ def main():
             if result["status"] == "matched":
                 plex_client.apply_poster(lib_item["item"], image_url=result["image_url"], dry_run=args.dry_run)
 
+                collection_name = None
+                if lib_item["type"] == "movie":
+                    movie_collections = plex_client.get_movie_collections(lib_item["item"])
+                    collection_name = determine_movie_collection_folder(
+                        key, title, year, movie_collections,
+                        collection_choices_by_key, collection_choices_path,
+                    )
+
                 saved_path = ""
                 if not args.no_images:
-                    saved_path = _save_poster_locally(title, year, lib_item["type"], result["image_url"], tpdb.session)
+                    saved_path = _save_poster_locally(
+                        title, year, lib_item["type"], result["image_url"], tpdb.session, collection_name
+                    )
 
-                print(f"MATCHED ({result['uploader']})", end="")
+                season_summary = ""
+                if lib_item["type"] == "show" and result.get("season_posters"):
+                    applied_seasons = apply_season_posters(
+                        lib_item, result["season_posters"], title, year, tpdb.session,
+                        args.no_images, args.dry_run,
+                    )
+                    if applied_seasons:
+                        season_summary = f"  [+{len(applied_seasons)} season poster(s)]"
+
+                print(f"MATCHED ({result['uploader']}){season_summary}", end="")
                 options = result.get("options", [])
                 if len(options) > 1:
                     print(f"  [{len(options)} options — see overrides.html]")
@@ -800,8 +1056,8 @@ def main():
                         "tpdb_url": result["tpdb_url"],
                         "chosen_image_url": result["image_url"],
                         "options": [
-                            {"uploader": u, "poster_id": pid, "image_url": img}
-                            for u, pid, img in options
+                            {"uploader": o["uploader"], "poster_id": o["poster_id"], "image_url": o["image_url"]}
+                            for o in options
                         ],
                     }
                     _rewrite_multi_options(multi_options_path, multi_options_by_key)
