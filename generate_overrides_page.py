@@ -229,23 +229,28 @@ render();
 """
 
 
-def main():
+def regenerate():
+    """Rebuild overrides.html from multi_options.json. Returns the number of
+    titles embedded, or None if there is no multi_options.json yet."""
     if not os.path.exists(JSON_PATH):
+        return None
+    with open(JSON_PATH, encoding="utf-8") as f:
+        data_text = f.read()
+    count = len(json.loads(data_text))  # also validates it's parseable
+    html = HTML_TEMPLATE.replace("__DATA__", data_text)
+    with open(HTML_PATH, "w", encoding="utf-8") as f:
+        f.write(html)
+    return count
+
+
+def main():
+    count = regenerate()
+    if count is None:
         sys.exit(
             f"{JSON_PATH} doesn't exist yet.\n"
             "It's created automatically by main.py whenever a title has more than "
             "one target-uploader poster — run main.py first."
         )
-
-    with open(JSON_PATH, encoding="utf-8") as f:
-        data_text = f.read()
-    json.loads(data_text)  # validate it's parseable before embedding
-
-    html = HTML_TEMPLATE.replace("__DATA__", data_text)
-    with open(HTML_PATH, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    count = len(json.loads(data_text))
     print(f"Wrote {HTML_PATH} ({count} title(s) with multiple options).")
     print("Open it in a browser to review and override poster choices.")
 

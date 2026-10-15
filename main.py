@@ -536,7 +536,7 @@ def process_new_user(tpdb, new_username, matched_by_key, unmatched_by_key, multi
             }
         _rewrite_multi_options(multi_options_path, multi_options_by_key)
         new_options += 1
-        print(f"found a {new_username} option -- see overrides.html")
+        print(f"found a {new_username} option")
 
     no_target_items = [(k, r) for k, r in unmatched_by_key.items() if r.get("status") == "no_target_poster"]
     print(f"\nChecking {len(no_target_items)} previously-unmatched title(s) (no target poster) "
@@ -1048,7 +1048,7 @@ def main():
                 print(f"MATCHED ({result['uploader']}){season_summary}", end="")
                 options = result.get("options", [])
                 if len(options) > 1:
-                    print(f"  [{len(options)} options — see overrides.html]")
+                    print(f"  [{len(options)} options]")
                     multi_options_by_key[key] = {
                         "title": title,
                         "year": year,
@@ -1105,8 +1105,22 @@ def main():
     print(f"Reports: {matched_path} and {unmatched_path}")
 
 
+def _refresh_overrides_page():
+    """Keep overrides.html in sync with multi_options.json after every run."""
+    try:
+        import generate_overrides_page
+        count = generate_overrides_page.regenerate()
+        if count is not None:
+            print(f"overrides.html refreshed ({count} title(s) with multiple options): "
+                  f"{generate_overrides_page.HTML_PATH}")
+    except Exception as exc:  # never let this mask the real run's result
+        print(f"(Couldn't refresh overrides.html: {exc})")
+
+
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
+        _refresh_overrides_page()
         sys.exit("\nInterrupted — progress so far is saved. Re-run the same command to resume.")
+    _refresh_overrides_page()
