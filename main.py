@@ -76,6 +76,7 @@ Pass --restart to ignore all of the above and reprocess everything.
 """
 import argparse
 import csv
+import datetime
 import json
 import os
 import shutil
@@ -418,6 +419,138 @@ def backfill_seasons(tpdb, matched_by_key, library_by_key, no_images, dry_run):
         total_seasons += len(applied)
 
     print(f"\nDone. {total_seasons} season poster(s) applied across {shows_with_seasons} show(s).")
+
+
+SEASON_RETRY_DAYS = 14   # how often to re-look for a season poster the uploader hasn't made yet
+SEASON_GIVE_UP_DAYS = 90  # ...and how long after first looking to stop trying
+
+
+def _season_state_key(key):
+    return "|".join(str(part) for part in key)
+
+
+def _load_season_state(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_season_state(path, state):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=1)
+
+
+def _record_seasons_applied(state, key, season_numbers):
+    entry = state.setdefault(_season_state_key(key), {"applied": [], "tried": {}})
+    entry["applied"] = sorted(set(entry["applied"]) | set(season_numbers))
+    for n in season_numbers:
+        entry["tried"].pop(str(n), None)
+
+
+def _local_season_numbers(title, year):
+    """Season numbers that already have a saved image in the show's folder
+    (from main runs, --backfill-seasons, or migrations)."""
+    show_dir = image_store.poster_dir(config.OUTPUT_DIR, title, year, "show")
+    if not os.path.isdir(show_dir):
+        return set()
+    names = os.listdir(show_dir)
+    found = set()
+    for fname in names:
+        if fname.startswith("Specials."):
+            found.add(0)
+        elif fname.startswith("Season "):
+            num = fname[len("Season "):].split(".", 1)[0]
+            if num.isdigit():
+                found.add(int(num))
+    return found
+
+
+def sync_new_seasons(tpdb, matched_by_key, library_by_key, state_path, state, no_images, dry_run):
+    """
+    Part of every normal run: for each already-applied show whose main
+    poster came from one of the configured uploaders, compare the seasons
+    Plex has now against the season posters already handled, and look up
+    ONLY the missing ones on that uploader's Set page.
+
+    A season counts as handled if it has a saved image in the show's
+    folder, or was applied in an earlier run (seasons_state.json). A season
+    the uploader hasn't made a poster for yet is retried every
+    SEASON_RETRY_DAYS for SEASON_GIVE_UP_DAYS after we first looked, so a
+    new season's poster gets picked up once it's uploaded. Specials
+    (season 0) are only looked for once, since many uploaders skip it.
+    Shows with nothing missing cost one quick Plex call and no TPDb requests.
+    """
+    allowed = {u.lower() for u in config.TPDB_USERS}
+    today = datetime.date.today()
+    checked = 0
+    total_applied = 0
+
+    for key, row in matched_by_key.items():
+        if row["type"] != "show" or row["applied"] != "True":
+            continue
+        if row["uploader"].lower() not in allowed or not row.get("tpdb_url"):
+            continue  # manual / custom poster, or an uploader no longer in the list
+        lib_item = library_by_key.get(key)
+        if lib_item is None:
+            continue
+
+        title, year = row["title"], row["year"]
+        try:
+            plex_seasons = {s.index for s in lib_item["item"].seasons()}
+        except Exception:
+            continue
+
+        entry = state.get(_season_state_key(key), {"applied": [], "tried": {}})
+        handled = set(entry["applied"]) | _local_season_numbers(title, year)
+        wanted = set()
+        for n in plex_seasons - handled:
+            tried = entry["tried"].get(str(n))
+            if tried:
+                if n == 0:
+                    continue
+                first = datetime.date.fromisoformat(tried["first"])
+                last = datetime.date.fromisoformat(tried["last"])
+                if (today - first).days > SEASON_GIVE_UP_DAYS or (today - last).days < SEASON_RETRY_DAYS:
+                    continue
+            wanted.add(n)
+        if not wanted:
+            continue
+
+        label = f"{title} ({year})" if year else title
+        print(f"[seasons] {label}: looking for season(s) {', '.join(str(n) for n in sorted(wanted))} ...", end=" ", flush=True)
+        checked += 1
+        try:
+            found = tpdb.find_target_posters(row["tpdb_url"], [row["uploader"]])
+            main_entry = next((f for f in found if f["season_number"] is None), None)
+            if not main_entry or not main_entry.get("set_url"):
+                print("no Set found")
+                continue
+            season_posters = tpdb.find_season_posters(main_entry["set_url"], expected_show_url=row["tpdb_url"])
+        except Exception as exc:
+            print(f"error: {exc}")
+            continue  # leave state alone so it retries next run
+
+        todo = [sp for sp in season_posters if sp["season_number"] in wanted]
+        applied = apply_season_posters(lib_item, todo, title, year, tpdb.session, no_images, dry_run) if todo else []
+        applied_numbers = {sp["season_number"] for sp in applied}
+        total_applied += len(applied_numbers)
+        print(f"[+{len(applied_numbers)} season poster(s)]" if applied_numbers else "none available yet")
+
+        if dry_run:
+            continue
+        _record_seasons_applied(state, key, applied_numbers)
+        entry = state[_season_state_key(key)]
+        for n in wanted - applied_numbers:
+            prev = entry["tried"].get(str(n), {"first": today.isoformat()})
+            entry["tried"][str(n)] = {"first": prev["first"], "last": today.isoformat()}
+        _save_season_state(state_path, state)
+
+    if checked:
+        print(f"Season sync: checked {checked} show(s), applied {total_applied} new season poster(s).")
 
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -870,6 +1003,11 @@ def main():
              "from the same uploader as the main poster (for a library processed before season "
              "support existed). Movies are skipped. Reuses each show's known TPDb page.",
     )
+    parser.add_argument(
+        "--skip-season-sync", action="store_true",
+        help="Skip the end-of-run check for season posters that are missing for seasons "
+             "Plex has (new seasons you've added since the last run).",
+    )
     args = parser.parse_args()
 
     config.validate()
@@ -881,6 +1019,7 @@ def main():
     multi_options_path = os.path.join(config.OUTPUT_DIR, "multi_options.json")
     checked_path = os.path.join(config.OUTPUT_DIR, "multi_options_checked.json")
     collection_choices_path = os.path.join(config.OUTPUT_DIR, "collection_choices.csv")
+    season_state_path = os.path.join(config.OUTPUT_DIR, "seasons_state.json")
 
     if args.restart:
         for p in (matched_path, unmatched_path):
@@ -1009,6 +1148,7 @@ def main():
     if reapplied_count:
         print(f"{reapplied_count} item(s) applied from cache.")
     print(f"{len(to_process)} item(s) to search/match this run.")
+    season_state = _load_season_state(season_state_path)
 
     try:
         for i, lib_item in enumerate(to_process, 1):
@@ -1044,6 +1184,9 @@ def main():
                     )
                     if applied_seasons:
                         season_summary = f"  [+{len(applied_seasons)} season poster(s)]"
+                        if not args.dry_run:
+                            _record_seasons_applied(season_state, key, [sp["season_number"] for sp in applied_seasons])
+                            _save_season_state(season_state_path, season_state)
 
                 print(f"MATCHED ({result['uploader']}){season_summary}", end="")
                 options = result.get("options", [])
@@ -1097,6 +1240,14 @@ def main():
         # Always leave both files in a consistent state, even on interruption.
         _rewrite_report(matched_path, MATCHED_FIELDS, matched_by_key)
         _rewrite_report(unmatched_path, UNMATCHED_FIELDS, unmatched_by_key)
+
+    if not args.skip_season_sync:
+        print()
+        print("Checking already-applied shows for new seasons...")
+        sync_new_seasons(
+            tpdb, matched_by_key, library_by_key, season_state_path, season_state,
+            args.no_images, args.dry_run,
+        )
 
     print()
     print(f"Done this run: {matched_count} matched, {unmatched_count} not matched, {reapplied_count} applied from cache.")

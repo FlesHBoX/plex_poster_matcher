@@ -366,3 +366,18 @@ technical minimum.
 - Be a reasonable citizen of someone else's server: the default 1-second
   delay between requests is intentional, and this is for personal-library
   use, not for bulk-mirroring TPDb's catalog.
+
+### New seasons are picked up automatically
+
+Every normal `python main.py` run ends with a season sync: for each
+already-applied show, it compares the seasons Plex has against the season
+posters already handled (images in the show's folder plus
+`output/seasons_state.json`), and looks up only the missing ones on the
+Set page of the uploader whose main poster was applied. Shows with nothing
+missing cost one Plex call and no TPDb requests.
+
+- A season the uploader hasn't made a poster for yet is retried every 14
+  days, for up to 90 days after first looking.
+- Specials (season 0) are only looked for once.
+- Manual/custom posters are skipped (there's no uploader Set to check).
+- Skip it with `--skip-season-sync`; `--dry-run` previews without recording.
